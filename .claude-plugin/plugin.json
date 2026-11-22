@@ -1,0 +1,17 @@
+{
+  "name": "grasp",
+  "displayName": "grasp",
+  "version": "0.1.0",
+  "description": "Learn while you vibe-code: episode-based learning gates, spaced retrieval, and adaptive scaffolding for agentic coding.",
+  "author": { "name": "Adi" },
+  "license": "MIT",
+  "keywords": ["learning", "education", "spaced-repetition", "vibe-coding"],
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Question language",
+      "description": "Language grasp asks questions in. Answers are accepted in any language.",
+      "default": "English"
+    }
+  }
+}

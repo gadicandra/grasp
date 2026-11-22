@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""grasp: learn while you vibe-code. Core CLI (stdlib only, Python 3.10+).
+
+Hooks call: context | gate | ingest
+Skills call: start | next | close | due | grade | adapt | status | init
+Git calls:   check-why <msgfile>
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+SCHEMA = 1
+PHASES = ["entry", "plan", "build", "verify", "close"]
+BOXES = [1, 3, 7, 21, 60]  # Leitner intervals in days
+ALPHA = 0.3                # mastery EMA weight
+WINDOW = 3                 # episodes considered by adapt
+GAP = 3                    # min episodes between level changes
+REJECT_COOLDOWN = 5        # episodes before re-proposing after a reject
+REENTRY_DAYS = 3
+
+# level -> knobs. ponytail: adapt moves the whole level one step; split into per-knob moves if levels feel too coarse.
+LEVELS = {
+    0: dict(plan_required=False, todo_human=0, todo_max_lines=0, hint_mode="explain", gate="soft"),
+    1: dict(plan_required=True, todo_human=1, todo_max_lines=10, hint_mode="explain", gate="hard"),
+    2: dict(plan_required=True, todo_human=2, todo_max_lines=15, hint_mode="socratic", gate="soft"),
+    3: dict(plan_required=True, todo_human=0, todo_max_lines=0, hint_mode="hint-only", gate="soft"),
+}
+STACKS = {"nextjs", "react", "vue", "svelte", "express", "prisma", "supabase", "tailwind", "node", "pytorch",
+          "huggingface", "django", "fastapi", "flask", "python", "rust", "go", "java", "general"}
+LEVEL_NAMES = {0: "Observer", 1: "Co-pilot", 2: "Pilot", 3: "Architect"}
+
+PHASE_GUIDE = {
+    "entry": "ENTRY: run the warm-up (re-entry questions / due cards) shown by `grasp start`. Ask, wait for answers, grade 0-2, record with `grasp grade`.",
+    "plan": "PLAN: the user writes `PLAN:` (3-5 lines: files touched, data flow, biggest risk). You critique it: one thing right, one risk missed. Never rewrite it. No code in this phase.",
+    "build": "BUILD: before the user reads your diff, ask them for a one-sentence prediction of what you changed and why. Leave the configured TODO(human) sections. End every turn with the grasp block.",
+    "verify": "VERIFY: ask the user for two failure scenarios / edge cases BEFORE you write tests or review. Then write tests covering theirs plus any they missed, and say which ones they missed.",
+    "close": "CLOSE: run /grasp:done.",
+}
+
+CONTRACT = """\
+[grasp] LEARNING CONTRACT (active for this session)
+The user is learning while building. Speed matters; their understanding matters more.
+
+MUST
+- Follow the current episode phase and knobs below exactly.
+- If plan_required and phase is PLAN and the user has not written `PLAN:`, ask for it. Do not write code.
+- Critique plans: one thing that is right, one risk they missed. Never rewrite their plan.
+- Leave exactly {todo_human} core-logic section(s) per task as `TODO(human)`, each <= {todo_max_lines} lines.
+  Boilerplate, config, styling: write in full. (0 = write everything yourself.)
+- Hint mode `{hint_mode}`: explain = explain directly; socratic = one guiding question first, then explain;
+  hint-only = give hints, not solutions, unless the user says "show me".
+- During an active episode, end every turn with a fenced block tagged `grasp` containing JSON:
+  {{"concepts": ["domain/concept"], "cards": [{{"scope": "concept|project", "concept": "domain/concept",
+   "q": "question", "a_hint": "key points of a good answer"}}], "plan_fix": "none|minor|major|null"}}
+  Add 0-2 cards per turn, only for non-obvious things worth remembering. `project` scope = specific to this
+  codebase (architecture, decisions); `concept` scope = portable knowledge. Use empty lists if nothing applies.
+
+MUST NOT
+- Write the `WHY:` section of a commit message for the user.
+- Answer quiz, warm-up, or re-entry questions for the user, even if asked. Offer a hint instead.
+- Review code before the user has stated their own concern ("I'm worried about ...").
+
+Ask questions in {language}. Accept answers in any language.{extra}
+"""
+
+
+# ---------- utils ----------
+
+def today() -> date:
+    return date.fromisoformat(os.environ["GRASP_TODAY"]) if os.environ.get("GRASP_TODAY") else date.today()
+
+
+def home() -> Path:
+    return Path(os.environ.get("GRASP_HOME") or Path.home() / ".grasp")
+
+
+def load(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as e:
+        sys.exit(f"grasp: corrupt JSON in {path}: {e}. Fix or delete the file.")
+
+
+def save(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)  # atomic: never leave a half-written journal
+
+
+def slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:40] or "episode"
+
+
+def emit(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def stdin_json() -> dict:
+    try:
+        return json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+# ---------- project ----------
+
+def project_root(cwd: str | None = None) -> Path:
+    p = Path(cwd or os.getcwd()).resolve()
+    for d in [p, *p.parents]:
+        if (d / ".grasp").is_dir() or (d / ".git").exists():
+            return d
+    return p
+
+
+def detect_domains(root: Path) -> list[str]:
+    found: list[str] = []
+    pkg = load(root / "package.json", None)
+    if isinstance(pkg, dict):
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        for key, dom in [("next", "nextjs"), ("react", "react"), ("vue", "vue"), ("svelte", "svelte"),
+                         ("express", "express"), ("prisma", "prisma"), ("@prisma/client", "prisma"),
+                         ("@supabase/supabase-js", "supabase"), ("tailwindcss", "tailwind")]:
+            if key in deps and dom not in found:
+                found.append(dom)
+        if "react" in found and "nextjs" in found:
+            found.remove("react")
+        found = found or ["node"]
+    py = ""
+    for f in ("pyproject.toml", "requirements.txt"):
+        if (root / f).exists():
+            py += (root / f).read_text(encoding="utf-8", errors="ignore").lower()
+    if py:
+        for key, dom in [("torch", "pytorch"), ("transformers", "huggingface"), ("django", "django"),
+                         ("fastapi", "fastapi"), ("flask", "flask")]:
+            if key in py and dom not in found:
+                found.append(dom)
+        if not any(d in found for d in ("pytorch", "huggingface", "django", "fastapi", "flask")):
+            found.append("python")
+    for f, dom in [("Cargo.toml", "rust"), ("go.mod", "go"), ("pom.xml", "java"), ("build.gradle", "java")]:
+        if (root / f).exists():
+            found.append(dom)
+    return found or ["general"]
+
+
+class Project:
+    def __init__(self, cwd: str | None = None):
+        self.root = project_root(cwd)
+        self.dir = self.root / ".grasp"
+        self.path = self.dir / "project.json"
+        self.data = load(self.path, None) or {
+            "schema_version": SCHEMA, "name": self.root.name, "domains": detect_domains(self.root),
+            "override": {}, "active": None, "episodes": [], "quick": 0, "prompts": 0, "last_touched": None,
+        }
+
+    @property
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    @property
+    def domain(self) -> str:
+        return self.data["domains"][0]
+
+    def active(self) -> dict | None:
+        a = self.data["active"]
+        return next((e for e in self.data["episodes"] if e["id"] == a), None) if a else None
+
+    def last_closed(self) -> dict | None:
+        closed = [e for e in self.data["episodes"] if e.get("closed")]
+        return closed[-1] if closed else None
+
+    def touch(self) -> None:
+        self.data["last_touched"] = today().isoformat()
+
+    def save(self) -> None:
+        save(self.path, self.data)
+        reg = load(home() / "projects.json", {})
+        reg[str(self.root)] = {"name": self.data["name"], "domains": self.data["domains"],
+                               "last_touched": self.data["last_touched"]}
+        save(home() / "projects.json", reg)
+
+
+# ---------- profile & knobs ----------
+
+def load_profile() -> dict:
+    return load(home() / "profile.json", {"schema_version": SCHEMA, "domains": {}, "concepts": {}, "log": []})
+
+
+def domain_state(profile: dict, dom: str) -> dict:
+    return profile["domains"].setdefault(dom, {
+        "level": 1, "flags": {}, "history": [], "last_change_at": 0, "cooldown_until": 0, "pending": None})
+
+
+def knobs(profile: dict, project: Project) -> dict:
+    ds = domain_state(profile, project.domain)
+    k = dict(LEVELS[ds["level"]])
+    if ds["flags"].get("force_plan"):
+        k["plan_required"] = True
+    k.update(project.data.get("override", {}))
+    return k
+
+
+# ---------- cards ----------
+
+def cards_path(scope: str, project: Project) -> Path:
+    return project.dir / "cards.json" if scope == "project" else home() / "cards.json"
+
+
+def add_card(card: dict, project: Project, episode: dict | None) -> None:
+    scope = "project" if card.get("scope") == "project" else "concept"
+    path = cards_path(scope, project)
+    cards = load(path, [])
+    if any(c["q"].strip().lower() == card.get("q", "").strip().lower() for c in cards) or not card.get("q"):
+        return
+    concept = card.get("concept") or f"{project.domain}/general"
+    cards.append({
+        "id": f"{'p' if scope == 'project' else 'c'}{len(cards) + 1:04d}",
+        "scope": scope, "domain": concept.split("/")[0], "concept": concept,
+        "q": card["q"].strip(), "a_hint": card.get("a_hint", ""), "box": 0,
+        "due": (today() + timedelta(days=BOXES[0])).isoformat(), "debt": bool(card.get("debt")),
+        "episode": episode["id"] if episode else None, "created": today().isoformat(),
+    })
+    save(path, cards)
+
+
+def leitner(box: int, score: int) -> int:
+    return min(box + 1, len(BOXES) - 1) if score == 2 else box if score == 1 else 0
+
+
+def ema(old: float | None, score: int, weight: float = 1.0) -> float:
+    a = min(1.0, ALPHA * weight)
+    return round(score / 2 if old is None else (1 - a) * old + a * (score / 2), 3)
+
+
+def due_cards(project: Project, limit: int, debt_only: bool = False) -> list[dict]:
+    t = today().isoformat()
+    pool = load(cards_path("project", project), [])
+    if not debt_only:
+        # stack cards only in matching projects; cross-cutting ones (security, testing, ...) everywhere
+        pool += [c for c in load(cards_path("concept", project), [])
+                 if c["domain"] in project.data["domains"] or c["domain"] not in STACKS]
+    if debt_only:
+        pool = [c for c in pool if c.get("debt")]
+    else:
+        pool = [c for c in pool if c["due"] <= t]
+    return sorted(pool, key=lambda c: (c["due"], c["box"]))[:limit]
+
+
+def grade_card(card_id: str, score: int, project: Project, weight: float = 1.0) -> dict:
+    scope = "project" if card_id.startswith("p") else "concept"
+    path = cards_path(scope, project)
+    cards = load(path, [])
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        sys.exit(f"grasp: no card {card_id}")
+    card["box"] = leitner(card["box"], score)
+    card["due"] = (today() + timedelta(days=BOXES[card["box"]])).isoformat()
+    if card.get("debt") and score == 2:
+        card["debt"] = False  # debt paid
+    save(path, cards)
+    profile = load_profile()
+    c = profile["concepts"].setdefault(card["concept"], {"mastery": None, "misconceptions": []})
+    c["mastery"] = ema(c["mastery"], score, weight)
+    save(home() / "profile.json", profile)
+    return card
+
+
+# ---------- adaptation ----------
+
+def propose(ds: dict) -> dict | None:
+    """Deterministic rules. Returns a proposal or None."""
+    hist = [h for h in ds["history"] if not h.get("rush")]
+    n = len(ds["history"])
+    if len(hist) < WINDOW or n - ds["last_change_at"] < GAP or n < ds["cooldown_until"]:
+        return None
+    win = hist[-WINDOW:]
+    w = sum(h.get("weight", 1) for h in win)
+    mean = sum(h["score"] * h.get("weight", 1) for h in win) / w
+    gap = sum(h.get("gap", 0) for h in win) / len(win)
+    majors = sum(h.get("plan_fix") == "major" for h in win)
+    if majors >= 2 and not ds["flags"].get("force_plan"):
+        return {"kind": "flag", "flag": "force_plan", "value": True,
+                "why": f"plan needed a major fix in {majors}/{WINDOW} recent episodes"}
+    if gap > 0.25 and not ds["flags"].get("calibrate"):
+        return {"kind": "flag", "flag": "calibrate", "value": True,
+                "why": f"self-score exceeded the graded score by {gap:.2f} on average (overconfidence)"}
+    if mean >= 0.8 and ds["level"] < 3:
+        return {"kind": "level", "from": ds["level"], "to": ds["level"] + 1,
+                "why": f"mean mastery {mean:.2f} >= 0.80 over last {WINDOW} episodes"}
+    if mean < 0.55 and ds["level"] > 0:
+        return {"kind": "level", "from": ds["level"], "to": ds["level"] - 1,
+                "why": f"mean mastery {mean:.2f} < 0.55 over last {WINDOW} episodes"}
+    return None
+
+
+def describe(dom: str, p: dict) -> str:
+    if p["kind"] == "level":
+        return (f"{dom}: L{p['from']} {LEVEL_NAMES[p['from']]} -> L{p['to']} {LEVEL_NAMES[p['to']]} "
+                f"({p['why']}). New knobs: {LEVELS[p['to']]}")
+    return f"{dom}: enable `{p['flag']}` ({p['why']})"
+
+
+def apply_decision(profile: dict, dom: str, accept: bool) -> str:
+    ds = domain_state(profile, dom)
+    p = ds["pending"]
+    if not p:
+        return f"No pending proposal for {dom}."
+    n = len(ds["history"])
+    if accept:
+        if p["kind"] == "level":
+            ds["level"] = p["to"]
+        else:
+            ds["flags"][p["flag"]] = p["value"]
+        ds["last_change_at"] = n
+    else:
+        ds["cooldown_until"] = n + REJECT_COOLDOWN
+    profile["log"].append({"date": today().isoformat(), "domain": dom, "proposal": p, "accepted": accept})
+    ds["pending"] = None
+    return ("Accepted: " if accept else "Rejected (will not re-propose for 5 episodes): ") + describe(dom, p)
+
+
+# ---------- block parsing ----------
+
+BLOCK_RE = re.compile(r"```grasp\s*\n(.*?)```", re.S)
+
+
+def parse_block(text: str) -> dict | None:
+    m = BLOCK_RE.findall(text or "")
+    if not m:
+        return None
+    try:
+        d = json.loads(m[-1])
+        return d if isinstance(d, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def check_why(msg: str) -> str | None:
+    """Return an error string, or None if the commit message passes."""
+    if re.match(r"^(Merge|Revert|fixup!|squash!)", msg):
+        return None
+    m = re.search(r"^WHY:(.*)", msg, re.S | re.M)
+    body = re.sub(r"^#.*$", "", m.group(1), flags=re.M) if m else ""
+    if len(body.split()) < 15:
+        return "grasp: commit rejected. Add a `WHY:` section (>= 15 words, your own words). Bypass: git commit --no-verify"
+    return None
+
+
+# ---------- commands: hooks ----------
+
+def cmd_context(_args):
+    d = stdin_json()
+    project = Project(d.get("cwd"))
+    profile = load_profile()
+    k = knobs(profile, project)
+    ds = domain_state(profile, project.domain)
+    ep = project.active()
+    lang = os.environ.get("CLAUDE_PLUGIN_OPTION_LANGUAGE") or "English"
+    extra = ""
+    if ds["flags"].get("calibrate"):
+        extra += "\n- CALIBRATION: before revealing any grade, ask the user to predict their own score first."
+    state = [f"\n[grasp] Project: {project.data['name']} | domains: {', '.join(project.data['domains'])} | "
+             f"level L{ds['level']} {LEVEL_NAMES[ds['level']]} | knobs: {json.dumps(k)}"]
+    if ep:
+        state.append(f"[grasp] Active episode #{ep['id']} \"{ep['title']}\"{' (RUSH: minimal friction)' if ep['rush'] else ''}"
+                     f" | phase: {ep['phase'].upper()}\n{PHASE_GUIDE[ep['phase']]}")
+        if ep.get("plan"):
+            state.append(f"[grasp] User's plan:\n{ep['plan']}")
+    else:
+        state.append("[grasp] No active episode. If the user starts building a feature, suggest `/grasp:start <title>` "
+                      "once. Do not insist. The contract's grasp-block rule applies only during an episode.")
+    due = len(due_cards(project, 99))
+    debt = len(due_cards(project, 99, debt_only=True))
+    if due or debt:
+        state.append(f"[grasp] {due} card(s) due, {debt} learning-debt item(s). They surface at /grasp:start.")
+    ctx = CONTRACT.format(language=lang, extra=extra, **k) + "\n".join(state)
+    emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}})
+
+
+IMPL_RE = re.compile(r"\b(build|implement|add|create|make|fix|refactor|write|buat|bikin|tambah)\b", re.I)
+
+
+def cmd_gate(_args):
+    d = stdin_json()
+    prompt = (d.get("user_input") or d.get("prompt") or "").strip()
+    if prompt.startswith("/"):
+        return
+    project = Project(d.get("cwd"))
+    ep = project.active()
+    if not project.exists:
+        return
+    project.data["prompts"] += 1
+    if prompt.startswith("!quick"):
+        project.data["quick"] += 1
+        project.save()
+        return
+    project.save()
+    if not ep:
+        return
+    k = knobs(load_profile(), project)
+    if ep["phase"] == "plan" and k["plan_required"] and not ep["rush"]:
+        if "PLAN:" in prompt:
+            ep["plan"] = prompt.split("PLAN:", 1)[1].strip()
+            project.save()
+            return
+        if IMPL_RE.search(prompt):
+            msg = ("[grasp] Phase is PLAN. Write `PLAN:` first (3-5 lines: files touched, data flow, biggest risk). "
+                   "Prefix with !quick for trivial changes.")
+            if k["gate"] == "hard":
+                emit({"decision": "block", "reason": msg})
+            else:
+                emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                             "additionalContext": msg + " (Soft gate: remind the user, then ask for the plan before coding.)"}})
+
+
+def cmd_ingest(_args):
+    d = stdin_json()
+    project = Project(d.get("cwd"))
+    ep = project.active()
+    if not ep:
+        return
+    block = parse_block(d.get("last_assistant_message", ""))
+    if block is None:
+        pid = d.get("prompt_id") or d.get("session_id")
+        if ep["phase"] in ("build", "verify") and not d.get("stop_hook_active") and ep.get("blocked_prompt") != pid:
+            ep["blocked_prompt"] = pid
+            project.save()
+            emit({"decision": "block", "reason": "[grasp] Append the ```grasp``` metadata block (JSON) to your reply."})
+        return
+    for c in block.get("concepts") or []:
+        if c not in ep["concepts"]:
+            ep["concepts"].append(c)
+    for card in (block.get("cards") or [])[:2]:
+        add_card(card, project, ep)
+    if block.get("plan_fix") in ("none", "minor", "major"):
+        ep["plan_fix"] = block["plan_fix"]
+    project.touch()
+    project.save()
+
+
+# ---------- commands: episode ----------
+
+def cmd_start(args):
+    rush = "--rush" in args
+    title = " ".join(a for a in args if a != "--rush").strip() or "untitled"
+    project = Project()
+    if (ep := project.active()):
+        sys.exit(f"grasp: episode #{ep['id']} \"{ep['title']}\" is still active. Run /grasp:done (or `grasp close --abandon`) first.")
+    last, touched = project.last_closed(), project.data.get("last_touched")
+    away = (today() - date.fromisoformat(touched)).days if touched else 0
+    eid = f"{len(project.data['episodes']) + 1:03d}"
+    ep = {"id": eid, "title": title, "slug": slug(title), "rush": rush, "phase": "entry", "started": today().isoformat(),
+          "closed": None, "plan": None, "concepts": [], "plan_fix": None, "skips": [], "blocked_prompt": None}
+    project.data["episodes"].append(ep)
+    project.data["active"] = eid
+    project.touch()
+    project.save()
+    k = knobs(load_profile(), project)
+    out = [f"Episode #{eid} \"{title}\" started in {project.data['name']} ({', '.join(project.data['domains'])})."
+           + (" RUSH mode: minimal friction; skipped understanding is recorded as learning debt." if rush else "")]
+    if rush:
+        ep["phase"] = "build"
+        project.save()
+        out.append("Phase -> BUILD. Still ask for a one-sentence prediction before the user reads the diff.")
+        print("\n".join(out))
+        return
+    if last and last.get("handoff") and away >= REENTRY_DAYS:
+        out.append(f"\nRE-ENTRY ({away} days away). Ask 2 questions about episode #{last['id']} \"{last['title']}\" "
+                   f"BEFORE showing this handoff note. Grade each 0-2 against it, then show it:\n---\n{last['handoff']}\n---")
+    debt_n = 2 if len(due_cards(project, 99, debt_only=True)) > 10 else 1
+    cards = due_cards(project, debt_n, debt_only=True) + due_cards(project, 3)
+    seen, warm = set(), []
+    for c in cards:
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            warm.append(c)
+    if warm:
+        out.append("\nWARM-UP CARDS (ask one at a time; user answers from memory; user self-scores 0-2 first, then you grade 0-2;"
+                   " record YOUR grade with `grasp grade <id> <score>`):")
+        out += [f"- [{c['id']}]{' (debt)' if c.get('debt') else ''} {c['q']}\n  answer key: {c['a_hint']}" for c in warm]
+    if not (last and away >= REENTRY_DAYS) and not warm:
+        out.append("No warm-up due.")
+    nxt = "plan" if k["plan_required"] else "build"
+    out.append(f"\nAfter the warm-up, run `grasp next` to move to {nxt.upper()}.")
+    print("\n".join(out))
+
+
+def cmd_next(args):
+    project = Project()
+    ep = project.active() or sys.exit("grasp: no active episode. Start one with /grasp:start <title>.")
+    k = knobs(load_profile(), project)
+    order = PHASES if k["plan_required"] else [p for p in PHASES if p != "plan"]
+    i = order.index(ep["phase"]) if ep["phase"] in order else 0
+    if "--skip" in args:
+        ep["skips"].append(ep["phase"])
+    ep["phase"] = order[min(i + 1, len(order) - 1)]
+    project.touch()
+    project.save()
+    print(f"Episode #{ep['id']} phase -> {ep['phase'].upper()}\n{PHASE_GUIDE[ep['phase']]}")
+
+
+def cmd_close(args):
+    """Reads JSON on stdin:
+    {"answers": [{"q","concept","scope","a_hint","self":0-2,"ai":0-2,"misconception"?}],
+     "handoff": "...", "debt": [{"q","concept","a_hint"}], "plan_fix": "none|minor|major"}"""
+    project = Project()
+    ep = project.active() or sys.exit("grasp: no active episode.")
+    if "--abandon" in args:
+        ep["closed"], ep["abandoned"] = today().isoformat(), True
+        project.data["active"] = None
+        project.save()
+        print(f"Episode #{ep['id']} abandoned (not counted).")
+        return
+    d = json.loads(sys.stdin.read())
+    answers = d.get("answers") or []
+    if not answers:
+        sys.exit("grasp: close needs at least one graded answer.")
+    for a in answers:
+        if not all(isinstance(a.get(x), int) and 0 <= a[x] <= 2 for x in ("self", "ai")):
+            sys.exit("grasp: each answer needs integer self and ai scores in 0..2.")
+    profile = load_profile()
+    weight = 0.5 if project.data.get("override") else 1.0
+    for a in answers:
+        add_card({**a}, project, ep)
+        c = profile["concepts"].setdefault(a.get("concept") or f"{project.domain}/general", {"mastery": None, "misconceptions": []})
+        c["mastery"] = ema(c["mastery"], a["ai"], weight)
+        if a.get("misconception"):
+            c["misconceptions"].append(a["misconception"])
+    for item in d.get("debt") or []:
+        add_card({**item, "scope": "project", "debt": True}, project, ep)
+    score = sum(a["ai"] for a in answers) / (2 * len(answers))
+    selfs = sum(a["self"] for a in answers) / (2 * len(answers))
+    ds = domain_state(profile, project.domain)
+    ds["history"].append({"episode": f"{project.data['name']}#{ep['id']}", "score": round(score, 3),
+                          "gap": round(selfs - score, 3), "plan_fix": d.get("plan_fix") or ep.get("plan_fix"),
+                          "rush": ep["rush"], "weight": weight, "date": today().isoformat()})
+    proposal = None if ds["pending"] else propose(ds)
+    if proposal:
+        ds["pending"] = proposal
+    save(home() / "profile.json", profile)
+
+    ep.update(closed=today().isoformat(), phase="close", handoff=d.get("handoff", ""), score=round(score, 3))
+    project.data["active"] = None
+    project.touch()
+    project.save()
+    md = [f"# Episode {ep['id']}: {ep['title']}", "",
+          f"- Dates: {ep['started']} -> {ep['closed']}{'  (RUSH)' if ep['rush'] else ''}",
+          f"- Score: {score:.2f} | self: {selfs:.2f} | calibration gap: {selfs - score:+.2f}",
+          f"- Concepts: {', '.join(ep['concepts']) or '-'}", f"- Skipped phases: {', '.join(ep['skips']) or '-'}", "",
+          "## Plan", ep.get("plan") or "_(none)_", "", "## Explain-back"]
+    md += [f"- **Q:** {a['q']}\n  - self {a['self']}/2, graded {a['ai']}/2" for a in answers]
+    md += ["", "## Handoff", ep["handoff"] or "_(none)_"]
+    if d.get("debt"):
+        md += ["", "## Learning debt"] + [f"- {x['q']}" for x in d["debt"]]
+    (project.dir / "episodes").mkdir(parents=True, exist_ok=True)
+    (project.dir / "episodes" / f"{ep['id']}-{ep['slug']}.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+
+    print(f"Episode #{ep['id']} closed. Score {score:.2f}, self {selfs:.2f}, gap {selfs - score:+.2f}.")
+    pend = domain_state(profile, project.domain)["pending"]
+    if pend:
+        print(f"ADAPTATION PROPOSAL -> {describe(project.domain, pend)}\n"
+              f"Ask the user: accept, reject, or dispute. Then run `grasp adapt accept|reject`.")
+
+
+# ---------- commands: review / status ----------
+
+def cmd_due(args):
+    n = int(args[0]) if args else 10
+    for c in due_cards(Project(), n):
+        print(f"[{c['id']}] ({c['concept']}{', debt' if c.get('debt') else ''}) {c['q']}\n  answer key: {c['a_hint']}")
+
+
+def cmd_grade(args):
+    if len(args) != 2 or args[1] not in ("0", "1", "2"):
+        sys.exit("usage: grasp grade <card_id> <0|1|2>")
+    c = grade_card(args[0], int(args[1]), Project())
+    print(f"{c['id']} -> box {c['box']}, next due {c['due']}")
+
+
+def cmd_adapt(args):
+    if not args or args[0] not in ("accept", "reject"):
+        sys.exit("usage: grasp adapt accept|reject [domain]")
+    profile = load_profile()
+    dom = args[1] if len(args) > 1 else Project().domain
+    print(apply_decision(profile, dom, args[0] == "accept"))
+    save(home() / "profile.json", profile)
+
+
+def cmd_status(_args):
+    project, profile = Project(), load_profile()
+    print(f"Project: {project.data['name']} ({project.root})\nDomains: {', '.join(project.data['domains'])}")
+    if project.data.get("override"):
+        print(f"Project override: {project.data['override']}")
+    p = project.data["prompts"]
+    print(f"!quick ratio: {project.data['quick']}/{p}" if p else "!quick ratio: -")
+    print("\nDomains:")
+    for dom, ds in profile["domains"].items():
+        recent = ", ".join(f"{h['score']:.2f}" for h in ds["history"][-5:]) or "-"
+        print(f"  {dom:12} L{ds['level']} {LEVEL_NAMES[ds['level']]:9} episodes={len(ds['history'])} recent={recent}"
+              f" flags={ds['flags'] or '-'}{'  PENDING: ' + describe(dom, ds['pending']) if ds['pending'] else ''}")
+    weak = sorted(((v["mastery"], k) for k, v in profile["concepts"].items() if v["mastery"] is not None))[:5]
+    if weak:
+        print("\nWeakest concepts:\n" + "\n".join(f"  {m:.2f} {k}" for m, k in weak))
+    debt = due_cards(project, 99, debt_only=True)
+    print(f"\nLearning debt: {len(debt)}" + "".join(f"\n  - {c['q']}" for c in debt))
+    print(f"Cards due: {len(due_cards(project, 999))}")
+    eps = project.data["episodes"][-5:]
+    if eps:
+        print("\nRecent episodes:\n" + "\n".join(
+            f"  #{e['id']} {e['title']} [{'active: ' + e['phase'] if not e['closed'] else 'score ' + str(e.get('score', '-'))}]"
+            for e in eps))
+    if profile["log"]:
+        print("\nAdaptation log:\n" + "\n".join(
+            f"  {x['date']} {'ACCEPT' if x['accepted'] else 'REJECT'} {describe(x['domain'], x['proposal'])}"
+            for x in profile["log"][-5:]))
+
+
+def cmd_init(args):
+    project = Project()
+    project.dir.mkdir(exist_ok=True)
+    if not project.exists:
+        project.touch()
+        project.save()
+    print(f"Project registered: {project.data['name']} -> domains {project.data['domains']}")
+    h = home()
+    if not (h / ".git").exists():
+        h.mkdir(parents=True, exist_ok=True)
+        os.system(f'git -C "{h}" init -q 2>/dev/null')
+        print(f"Global journal: {h} (git repo; push it to a PRIVATE remote to sync devices)")
+    if "--gitignore" in args:
+        gi = project.root / ".gitignore"
+        if ".grasp/" not in (gi.read_text() if gi.exists() else ""):
+            with gi.open("a") as f:
+                f.write("\n.grasp/\n")
+        print(".grasp/ added to .gitignore")
+    if "--commit-hook" in args:
+        git = project.root / ".git"
+        if not git.is_dir():
+            sys.exit("grasp: not a git repo; skipping commit hook.")
+        hook = git / "hooks" / "commit-msg"
+        if hook.exists() and "grasp" not in hook.read_text():
+            sys.exit(f"grasp: {hook} already exists and is not grasp's. Not overwriting.")
+        hook.parent.mkdir(exist_ok=True)
+        # self-contained: must survive plugin updates that move CLAUDE_PLUGIN_ROOT
+        hook.write_text(COMMIT_HOOK, encoding="utf-8")
+        hook.chmod(0o755)
+        print("commit-msg hook installed: commits need a WHY: section (>= 15 words).")
+
+
+COMMIT_HOOK = r'''#!/usr/bin/env python3
+# grasp commit-msg hook: require a WHY: section written by you. Bypass: git commit --no-verify
+import re, sys
+msg = open(sys.argv[1], encoding="utf-8").read()
+if not re.match(r"^(Merge|Revert|fixup!|squash!)", msg):
+    m = re.search(r"^WHY:(.*)", msg, re.S | re.M)
+    body = re.sub(r"^#.*$", "", m.group(1), flags=re.M) if m else ""
+    if len(body.split()) < 15:
+        sys.exit("grasp: commit rejected. Add a `WHY:` section (>= 15 words, your own words). Bypass: git commit --no-verify")
+'''
+
+
+def cmd_check_why(args):
+    err = check_why(Path(args[0]).read_text(encoding="utf-8"))
+    if err:
+        sys.exit(err)
+
+
+COMMANDS = {
+    "context": cmd_context, "gate": cmd_gate, "ingest": cmd_ingest,
+    "start": cmd_start, "next": cmd_next, "close": cmd_close,
+    "due": cmd_due, "grade": cmd_grade, "adapt": cmd_adapt, "status": cmd_status, "init": cmd_init,
+    "check-why": cmd_check_why,
+}
+
+
+def main(argv: list[str]) -> None:
+    if sys.version_info < (3, 10):
+        sys.exit("grasp: requires Python 3.10+")
+    if not argv or argv[0] not in COMMANDS:
+        sys.exit("usage: grasp " + "|".join(COMMANDS))
+    COMMANDS[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
