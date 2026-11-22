@@ -37,7 +37,7 @@ LEVEL_NAMES = {0: "Observer", 1: "Co-pilot", 2: "Pilot", 3: "Architect"}
 PHASE_GUIDE = {
     "entry": "ENTRY: run the warm-up (re-entry questions / due cards) shown by `grasp start`. Ask, wait for answers, grade 0-2, record with `grasp grade`.",
     "plan": "PLAN: the user writes `PLAN:` (3-5 lines: files touched, data flow, biggest risk). You critique it: one thing right, one risk missed. Never rewrite it. No code in this phase.",
-    "build": "BUILD: before the user reads your diff, ask them for a one-sentence prediction of what you changed and why. Leave the configured TODO(human) sections. End every turn with the grasp block.",
+    "build": "BUILD: the plan was already critiqued; do not repeat the critique. Before the user reads your diff, ask them for a one-sentence prediction of what you changed and why. Leave the configured TODO(human) sections. End every turn with the grasp block.",
     "verify": "VERIFY: ask the user for two failure scenarios / edge cases BEFORE you write tests or review. Then write tests covering theirs plus any they missed, and say which ones they missed.",
     "close": "CLOSE: run /grasp:done.",
 }

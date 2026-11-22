@@ -1,6 +1,15 @@
 {
   "name": "grasp",
   "description": "grasp: understand what you ship.",
-  "owner": { "name": "Adi" },
-  "plugins": [{ "name": "grasp", "source": "./", "description": "Learn while you vibe-code." }]
+  "owner": {
+    "name": "Adi Candra",
+    "url": "https://github.com/gadicandra"
+  },
+  "plugins": [
+    {
+      "name": "grasp",
+      "source": "./",
+      "description": "Learn while you vibe-code."
+    }
+  ]
 }

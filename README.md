@@ -10,7 +10,7 @@ grasp adds a few small, research-backed moments of friction at the points where 
 ## Install
 
 ```
-/plugin marketplace add <owner>/grasp
+/plugin marketplace add gadicandra/grasp
 /plugin install grasp@grasp
 /grasp:init
 ```

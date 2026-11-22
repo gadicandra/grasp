@@ -3,9 +3,17 @@
   "displayName": "grasp",
   "version": "0.1.0",
   "description": "Learn while you vibe-code: episode-based learning gates, spaced retrieval, and adaptive scaffolding for agentic coding.",
-  "author": { "name": "Adi" },
+  "author": {
+    "name": "Adi Candra",
+    "url": "https://github.com/gadicandra"
+  },
   "license": "MIT",
-  "keywords": ["learning", "education", "spaced-repetition", "vibe-coding"],
+  "keywords": [
+    "learning",
+    "education",
+    "spaced-repetition",
+    "vibe-coding"
+  ],
   "userConfig": {
     "language": {
       "type": "string",
@@ -13,5 +21,7 @@
       "description": "Language grasp asks questions in. Answers are accepted in any language.",
       "default": "English"
     }
-  }
+  },
+  "homepage": "https://github.com/gadicandra/grasp",
+  "repository": "https://github.com/gadicandra/grasp"
 }
